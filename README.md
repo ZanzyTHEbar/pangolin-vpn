@@ -1,6 +1,6 @@
 # Pangolin Podman client
 
-Run the Pangolin client for any linux machine with the upstream image `ghcr.io/zanzythebar/pangolin-client-container:latest` using a rootful Podman Quadlet system service.
+Run the Pangolin client for any linux machine with the upstream image [`ghcr.io/zanzythebar/pangolin-client-container:latest`](https://github.com/ZanzyTHEbar/pangolin-client-container) using a rootful Podman Quadlet system service.
 
 - `./login.sh`: run the interactive `login-plain` flow with rootless Podman, then sync the resulting auth/device state into the rootful volumes.
 - `./run.sh`: run the actual VPN client as a rootful systemd-managed Quadlet service.
