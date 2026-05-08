@@ -1,15 +1,11 @@
 # Pangolin Podman client
 
-Run the Pangolin client for this machine with the upstream image `ghcr.io/zanzythebar/pangolin-client-container:latest` using a rootful Podman Quadlet system service.
-
-This repo is a thin machine-specific config repo. It is not an upstream clone.
-
-Upstream Pangolin supports rootless Podman on some hosts, but this machine rejects Pangolin's TUN setup even with the exact upstream-style manual rootless `podman run` command. The failure is `Failed to create TUN device: operation not permitted`. At the same time, the rootful interactive login path hangs before showing the device code. The proven working design on this host is therefore split:
+Run the Pangolin client for any linux machine with the upstream image `ghcr.io/zanzythebar/pangolin-client-container:latest` using a rootful Podman Quadlet system service.
 
 - `./login.sh`: run the interactive `login-plain` flow with rootless Podman, then sync the resulting auth/device state into the rootful volumes.
 - `./run.sh`: run the actual VPN client as a rootful systemd-managed Quadlet service.
 
-Do not delete the `pangolin-client-config` or `pangolin-client-etc` volumes unless you intentionally want to forget this machine and log in again.
+Do not delete the `pangolin-client-config` or `pangolin-client-etc` volumes unless you intentionally want to forget your machine and log in again.
 
 Set `PANGOLIN_ENDPOINT` to your Pangolin dashboard URL, for example `https://vpn.example.com`.
 
@@ -20,7 +16,7 @@ Set `PANGOLIN_ENDPOINT` to your Pangolin dashboard URL, for example `https://vpn
 - `rsync`
 - systemd
 - `/dev/net/tun`
-- `NET_ADMIN` support for Podman on this host
+- `NET_ADMIN` support for Podman
 
 ## Design
 
@@ -40,13 +36,11 @@ Set `PANGOLIN_ENDPOINT` to your Pangolin dashboard URL, for example `https://vpn
 
    If `.env` is missing, recreate it with `cp .env.example .env`. Set `PANGOLIN_ENDPOINT` to your dashboard URL. Add `PANGOLIN_CLIENT_ID` and `PANGOLIN_CLIENT_SECRET` only if you want credential-based login.
 
-2. Log this machine into Pangolin
+2. Log your machine into Pangolin
 
    ```bash
    ./login.sh
    ```
-
-    This host's rootful Pangolin login path hangs before showing the device code, even with the upstream `login-plain` image changes. Because direct rootless `login-plain` works in the real shell, `login.sh` now uses rootless Podman only for the interactive login step.
 
     After the login succeeds, the script copies the resulting auth/device state into the rootful named volumes `pangolin-client-config` and `pangolin-client-etc` that the systemd service uses.
 
@@ -119,11 +113,11 @@ After `./run.sh`, use these checks.
    getent ahosts <private-nfs.example.internal>
    ```
 
-8. Test a known internal/private destination reachable only through Pangolin. Replace `<private-host-or-alias>` with one of your actual private Pangolin targets.
+8. Test a known internal/private destination reachable only through Pangolin. Replace `<private-host-or-alias>` with one of your actual private Pangolin targets. Remember that ICMP does not work with aliases, you must use an FQDN or CIDR. 
 
    ```bash
    getent ahosts <private-host-or-alias>
-   ping -c 3 <private-host-or-alias>
+   ping -c 3 <private-host>
    curl -I http://<private-host-or-alias>
    ```
 
@@ -164,7 +158,7 @@ sudo podman volume inspect pangolin-client-config pangolin-client-etc
   systemctl --user daemon-reload
   ```
 
-- If you intentionally want to forget this machine completely and force a fresh login on the next run:
+- If you intentionally want to forget your machine completely and force a fresh login on the next run:
 
   ```bash
   sudo systemctl stop pangolin-client.service
