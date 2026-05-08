@@ -1,0 +1,24 @@
+[Unit]
+Description=Pangolin client container
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+Image=ghcr.io/zanzythebar/pangolin-client-container:latest
+ContainerName=pangolin-client
+Network=host
+AddCapability=NET_ADMIN
+AddDevice=/dev/net/tun
+SecurityLabelDisable=true
+EnvironmentFile=/etc/pangolin-client/pangolin-client.env
+Volume=pangolin-client-config.volume:/root/.config/pangolin:Z
+Volume=pangolin-client-etc.volume:/etc/pangolin:Z
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+ExecStartPost=/usr/local/bin/pangolin-client-dns start
+ExecStopPost=/usr/local/bin/pangolin-client-dns stop
+
+[Install]
+WantedBy=multi-user.target
