@@ -11,7 +11,14 @@ SYSTEM_QUADLET_DIR="/etc/containers/systemd"
 SYSTEM_ENV_DIR="/etc/pangolin-client"
 SYSTEM_ENV_FILE="$SYSTEM_ENV_DIR/pangolin-client.env"
 SYSTEM_BIN_DIR="/usr/local/bin"
+SYSTEM_SBIN_DIR="/usr/local/sbin"
 SYSTEM_DNS_HELPER="$SYSTEM_BIN_DIR/pangolin-client-dns"
+SYSTEM_VPN_WRAPPER="$SYSTEM_BIN_DIR/pangolin-vpn"
+SYSTEM_ROUTE_HELPER="$SYSTEM_SBIN_DIR/pangolin-route-helper"
+SYSTEM_READY_HELPER="$SYSTEM_SBIN_DIR/pangolin-vpn-ready"
+SYSTEM_READY_SERVICE="/etc/systemd/system/pangolin-vpn-ready.service"
+SYSTEM_DROPIN_DIR="/etc/systemd/system/pangolin-client.service.d"
+SYSTEM_ROUTE_DROPIN="$SYSTEM_DROPIN_DIR/10-pangolin-route-helper.conf"
 USER_QUADLET_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/containers/systemd"
 
 fail() {
@@ -84,8 +91,10 @@ fi
 require_command sudo
 require_command podman
 require_command systemctl
+require_command systemd-run
 require_command install
 require_command resolvectl
+require_command ip
 [[ -c /dev/net/tun ]] || fail "/dev/net/tun is not available on this host."
 
 if [[ ! -r "$ENV_FILE" ]]; then
@@ -118,10 +127,17 @@ cleanup_old_user_quadlets
 sudo install -d -m 0755 "$SYSTEM_QUADLET_DIR"
 sudo install -d -m 0755 "$SYSTEM_ENV_DIR"
 sudo install -d -m 0755 "$SYSTEM_BIN_DIR"
+sudo install -d -m 0755 "$SYSTEM_SBIN_DIR"
+sudo install -d -m 0755 "$SYSTEM_DROPIN_DIR"
 sudo install -m 0644 "$SCRIPT_DIR/quadlet/pangolin-client.container" "$SYSTEM_QUADLET_DIR/pangolin-client.container"
 sudo install -m 0644 "$SCRIPT_DIR/quadlet/pangolin-client-config.volume" "$SYSTEM_QUADLET_DIR/pangolin-client-config.volume"
 sudo install -m 0644 "$SCRIPT_DIR/quadlet/pangolin-client-etc.volume" "$SYSTEM_QUADLET_DIR/pangolin-client-etc.volume"
 sudo install -m 0755 "$SCRIPT_DIR/pangolin-dns.sh" "$SYSTEM_DNS_HELPER"
+sudo install -m 0755 "$SCRIPT_DIR/pangolin-vpn" "$SYSTEM_VPN_WRAPPER"
+sudo install -m 0755 "$SCRIPT_DIR/pangolin-route-helper" "$SYSTEM_ROUTE_HELPER"
+sudo install -m 0755 "$SCRIPT_DIR/pangolin-vpn-ready" "$SYSTEM_READY_HELPER"
+sudo install -m 0644 "$SCRIPT_DIR/systemd/pangolin-vpn-ready.service" "$SYSTEM_READY_SERVICE"
+sudo install -m 0644 "$SCRIPT_DIR/systemd/pangolin-client.service.d/10-pangolin-route-helper.conf" "$SYSTEM_ROUTE_DROPIN"
 sudo install -m 0600 "$ENV_FILE" "$SYSTEM_ENV_FILE"
 
 sudo podman pull "$IMAGE"
@@ -139,6 +155,13 @@ fi
 
 echo "Installed rootful Quadlet files into $SYSTEM_QUADLET_DIR"
 echo "Installed Pangolin DNS helper into $SYSTEM_DNS_HELPER"
+echo "Installed Pangolin VPN wrapper into $SYSTEM_VPN_WRAPPER"
+echo "Installed Pangolin route helper into $SYSTEM_ROUTE_HELPER"
+echo "Installed Pangolin readiness helper into $SYSTEM_READY_HELPER"
+echo "Installed Pangolin readiness service into $SYSTEM_READY_SERVICE"
+echo "Installed Pangolin route helper drop-in into $SYSTEM_ROUTE_DROPIN"
 echo "Installed service environment file into $SYSTEM_ENV_FILE"
 echo "Pangolin client started. Check status: sudo systemctl status pangolin-client.service"
 echo "Logs: sudo journalctl -u pangolin-client.service -f"
+echo "Control: pangolin-vpn status | sudo pangolin-vpn on | sudo pangolin-vpn off"
+echo "Readiness: sudo pangolin-vpn-ready"

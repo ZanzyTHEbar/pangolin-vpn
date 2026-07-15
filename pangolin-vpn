@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# User-facing control wrapper for the system Pangolin client service.
+
+set -euo pipefail
+
+ORIGINAL_ARGS=("$@")
+ENV_FILE="${PANGOLIN_ENV_FILE:-/etc/pangolin-client/pangolin-client.env}"
+
+load_env_file() {
+  local file="$1"
+  local line key value
+
+  [[ -r "$file" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    case "$line" in
+      ''|'#'*)
+        continue
+        ;;
+    esac
+
+    [[ "$line" == *=* ]] || continue
+    key="${line%%=*}"
+    value="${line#*=}"
+
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    [[ ${!key+x} ]] && continue
+
+    if (( ${#value} >= 2 )); then
+      case "$value" in
+        \"*\") value="${value:1:${#value}-2}" ;;
+        \'*\') value="${value:1:${#value}-2}" ;;
+      esac
+    fi
+
+    printf -v "$key" '%s' "$value"
+    export "$key"
+  done < "$file"
+}
+
+load_env_file "$ENV_FILE"
+
+SERVICE="${PANGOLIN_SERVICE:-pangolin-client.service}"
+CONTROL_DIR="${PANGOLIN_CONTROL_DIR:-/run/pangolin-client-control}"
+CONTROL_MARKER="${PANGOLIN_CONTROL_MARKER:-${CONTROL_DIR}/enabled}"
+PANGOLIN_IF="${PANGOLIN_INTERFACE_NAME:-pangolin}"
+ROUTE_HELPER="${PANGOLIN_ROUTE_HELPER:-/usr/local/sbin/pangolin-route-helper}"
+ACTIVE_WAIT_SECONDS="${PANGOLIN_ACTIVE_WAIT_SECONDS:-30}"
+
+SYSTEMCTL="${SYSTEMCTL:-systemctl}"
+IP="${IP:-ip}"
+PKEXEC="${PKEXEC:-pkexec}"
+READLINK="${READLINK:-readlink}"
+
+usage() {
+  cat <<'USAGE'
+Usage: pangolin-vpn {on|off|restart|status}
+
+Commands:
+  on       Mark Pangolin as manually enabled and start pangolin-client.service.
+  off      Mark Pangolin as disabled and stop pangolin-client.service.
+  restart  Restart Pangolin while keeping it manually enabled.
+  status   Show manual state, service state, interface, and managed routes.
+USAGE
+}
+
+self_path() {
+  local resolved
+  resolved="$($READLINK -f "$0" 2>/dev/null || true)"
+  if [[ -n "$resolved" ]]; then
+    printf '%s\n' "$resolved"
+  elif [[ "$0" = /* ]]; then
+    printf '%s\n' "$0"
+  else
+    command -v -- "$0"
+  fi
+}
+
+require_root() {
+  if (( EUID == 0 )); then
+    return 0
+  fi
+
+  if command -v "$PKEXEC" >/dev/null 2>&1; then
+    exec "$PKEXEC" "$(self_path)" "${ORIGINAL_ARGS[@]}"
+  fi
+
+  echo "pangolin-vpn: root privileges required for this command" >&2
+  exit 1
+}
+
+run_route_helper() {
+  if [[ -x "$ROUTE_HELPER" ]]; then
+    "$ROUTE_HELPER" >/dev/null 2>&1 || true
+  fi
+}
+
+wait_active() {
+  local deadline=$((SECONDS + ACTIVE_WAIT_SECONDS))
+
+  while (( SECONDS <= deadline )); do
+    if "$SYSTEMCTL" is-active --quiet "$SERVICE"; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "pangolin-vpn: $SERVICE did not become active within ${ACTIVE_WAIT_SECONDS}s" >&2
+  return 1
+}
+
+manual_state() {
+  if [[ -e "$CONTROL_MARKER" ]]; then
+    echo "on"
+  else
+    echo "off"
+  fi
+}
+
+managed_targets() {
+  local raw="${PANGOLIN_MANAGED_HOSTS:-}"
+  local target
+  local -a targets=()
+
+  raw="${raw//,/ }"
+  read -r -a targets <<< "$raw"
+
+  for target in "${targets[@]}"; do
+    [[ -n "$target" ]] && printf '%s\n' "$target"
+  done
+}
+
+route_prefix() {
+  local target="$1"
+
+  if [[ "$target" == */* ]]; then
+    printf '%s\n' "$target"
+  else
+    printf '%s/32\n' "$target"
+  fi
+}
+
+probe_address() {
+  printf '%s\n' "${1%%/*}"
+}
+
+show_status() {
+  local target route destination
+  local printed_targets=0
+
+  echo "manual-enabled=$(manual_state)"
+  "$SYSTEMCTL" show "$SERVICE" \
+    -p ActiveState \
+    -p SubState \
+    -p Result \
+    -p UnitFileState \
+    -p FragmentPath \
+    -p SourcePath || true
+
+  if "$IP" link show "$PANGOLIN_IF" >/dev/null 2>&1; then
+    "$IP" -brief addr show "$PANGOLIN_IF" || true
+  else
+    echo "$PANGOLIN_IF=absent"
+  fi
+
+  while IFS= read -r target; do
+    printed_targets=1
+    route="$(route_prefix "$target")"
+    destination="$(probe_address "$target")"
+    "$IP" -4 route get "$destination" 2>/dev/null || true
+    "$IP" route show "$route" 2>/dev/null || true
+  done < <(managed_targets)
+
+  if (( ! printed_targets )); then
+    echo "managed-hosts=none"
+  fi
+}
+
+turn_on() {
+  require_root
+  mkdir -p "$CONTROL_DIR"
+  chmod 0755 "$CONTROL_DIR"
+
+  if ! "$SYSTEMCTL" start "$SERVICE" || ! wait_active; then
+    rm -f "$CONTROL_MARKER"
+    return 1
+  fi
+
+  : > "$CONTROL_MARKER"
+  chmod 0644 "$CONTROL_MARKER"
+  run_route_helper
+  show_status
+}
+
+turn_off() {
+  require_root
+  rm -f "$CONTROL_MARKER"
+
+  "$SYSTEMCTL" stop "$SERVICE" || true
+  run_route_helper
+
+  if "$SYSTEMCTL" is-active --quiet "$SERVICE"; then
+    echo "pangolin-vpn: $SERVICE is still active after stop" >&2
+    return 1
+  fi
+
+  show_status
+}
+
+case "${1:-}" in
+  on|start)
+    shift || true
+    turn_on "$@"
+    ;;
+  off|stop)
+    shift || true
+    turn_off "$@"
+    ;;
+  restart)
+    require_root
+    mkdir -p "$CONTROL_DIR"
+    chmod 0755 "$CONTROL_DIR"
+    if ! "$SYSTEMCTL" restart "$SERVICE" || ! wait_active; then
+      rm -f "$CONTROL_MARKER"
+      exit 1
+    fi
+
+    : > "$CONTROL_MARKER"
+    chmod 0644 "$CONTROL_MARKER"
+    run_route_helper
+    show_status
+    ;;
+  status)
+    show_status
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

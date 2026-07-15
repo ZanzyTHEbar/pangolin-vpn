@@ -1,0 +1,9 @@
+[Unit]
+Description=Wait for private resource path via trusted LAN or Pangolin
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=90
+ExecStart=/usr/local/sbin/pangolin-vpn-ready

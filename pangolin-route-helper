@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+# Prefer trusted LAN routes for configured private hosts, otherwise restore
+# those routes through the Pangolin tunnel.
+
+set -euo pipefail
+
+ENV_FILE="${PANGOLIN_ENV_FILE:-/etc/pangolin-client/pangolin-client.env}"
+
+load_env_file() {
+  local file="$1"
+  local line key value
+
+  [[ -r "$file" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    case "$line" in
+      ''|'#'*)
+        continue
+        ;;
+    esac
+
+    [[ "$line" == *=* ]] || continue
+    key="${line%%=*}"
+    value="${line#*=}"
+
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    [[ ${!key+x} ]] && continue
+
+    if (( ${#value} >= 2 )); then
+      case "$value" in
+        \"*\") value="${value:1:${#value}-2}" ;;
+        \'*\') value="${value:1:${#value}-2}" ;;
+      esac
+    fi
+
+    printf -v "$key" '%s' "$value"
+    export "$key"
+  done < "$file"
+}
+
+load_env_file "$ENV_FILE"
+
+PANGOLIN_IF="${PANGOLIN_INTERFACE_NAME:-pangolin}"
+TRUSTED_LAN_PREFIX="${PANGOLIN_TRUSTED_LAN_PREFIX:-}"
+TRUSTED_GATEWAY="${PANGOLIN_TRUSTED_GATEWAY:-}"
+TRUSTED_GATEWAY_MAC="${PANGOLIN_TRUSTED_GATEWAY_MAC:-}"
+TRUSTED_GATEWAY_PROBE_TIMEOUT="${PANGOLIN_TRUSTED_GATEWAY_PROBE_TIMEOUT:-2}"
+ROUTE_STATE_DIR="${PANGOLIN_ROUTE_STATE_DIR:-/run/pangolin-route-helper}"
+SETTLE_SECONDS=0
+
+LAN_IF=""
+LAN_IP=""
+
+log() {
+  local message="$*"
+
+  echo "pangolin-route-helper: $message"
+  if command -v logger >/dev/null 2>&1; then
+    logger -t pangolin-route-helper -- "$message" || true
+  fi
+}
+
+usage() {
+  echo "Usage: $0 [--settle SECONDS|--status]" >&2
+}
+
+managed_targets() {
+  local raw="${PANGOLIN_MANAGED_HOSTS:-}"
+  local target
+  local -a targets=()
+
+  raw="${raw//,/ }"
+  read -r -a targets <<< "$raw"
+
+  for target in "${targets[@]}"; do
+    [[ -n "$target" ]] && printf '%s\n' "$target"
+  done
+}
+
+route_prefix() {
+  local target="$1"
+
+  if [[ "$target" == */* ]]; then
+    printf '%s\n' "$target"
+  else
+    printf '%s/32\n' "$target"
+  fi
+}
+
+probe_address() {
+  printf '%s\n' "${1%%/*}"
+}
+
+state_file() {
+  local route="$1"
+  local key="${route//\//_}"
+
+  printf '%s/%s' "$ROUTE_STATE_DIR" "$key"
+}
+
+record_owned_route() {
+  local route="$1"
+  local file
+
+  file="$(state_file "$route")"
+  mkdir -p "$ROUTE_STATE_DIR"
+  chmod 0755 "$ROUTE_STATE_DIR"
+  printf '%s\t%s\t%s\n' "$route" "$LAN_IF" "$LAN_IP" > "$file"
+}
+
+clear_owned_route() {
+  local route="$1"
+
+  rm -f "$(state_file "$route")"
+}
+
+status() {
+  local target route destination
+  local printed_targets=0
+
+  ip -brief address show || true
+  while IFS= read -r target; do
+    printed_targets=1
+    route="$(route_prefix "$target")"
+    destination="$(probe_address "$target")"
+    ip -4 route get "$destination" 2>/dev/null || true
+    ip route show "$route" 2>/dev/null || true
+  done < <(managed_targets)
+
+  if (( ! printed_targets )); then
+    echo "managed-hosts=none"
+  fi
+}
+
+probe_gateway() {
+  local ifname="$1"
+
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${TRUSTED_GATEWAY_PROBE_TIMEOUT}s" ping -c 1 -W 1 -I "$ifname" "$TRUSTED_GATEWAY" >/dev/null 2>&1 || true
+  else
+    ping -c 1 -W 1 -I "$ifname" "$TRUSTED_GATEWAY" >/dev/null 2>&1 || true
+  fi
+}
+
+detect_lan() {
+  local ifname family addr ip_addr default_if default_src neigh_mac
+
+  LAN_IF=""
+  LAN_IP=""
+
+  [[ -n "$TRUSTED_LAN_PREFIX" && -n "$TRUSTED_GATEWAY" ]] || return 1
+
+  while read -r _ ifname family addr _rest; do
+    [[ "$family" == "inet" ]] || continue
+    ifname="${ifname%%@*}"
+    ip_addr="${addr%/*}"
+
+    case "$ifname" in
+      lo|"$PANGOLIN_IF"|docker*|br-*|veth*|virbr*|tailscale*|wg*)
+        continue
+        ;;
+    esac
+
+    case "$ip_addr" in
+      "$TRUSTED_LAN_PREFIX"*)
+        default_if="$(ip -4 route get "$TRUSTED_GATEWAY" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1 || true)"
+        default_src="$(ip -4 route get "$TRUSTED_GATEWAY" 2>/dev/null | sed -n 's/.* src \([^ ]*\).*/\1/p' | head -n1 || true)"
+        [[ "$default_if" == "$ifname" && "$default_src" == "$ip_addr" ]] || continue
+
+        if [[ -n "$TRUSTED_GATEWAY_MAC" ]]; then
+          probe_gateway "$ifname"
+          neigh_mac="$(ip neigh show "$TRUSTED_GATEWAY" dev "$ifname" 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "lladdr") {print tolower($(i + 1)); exit}}')"
+          [[ "$neigh_mac" == "${TRUSTED_GATEWAY_MAC,,}" ]] || continue
+        fi
+
+        LAN_IF="$ifname"
+        LAN_IP="$ip_addr"
+        return 0
+        ;;
+    esac
+  done < <(ip -o -4 addr show scope global up)
+
+  return 1
+}
+
+install_lan_routes() {
+  local target route destination changed
+
+  while IFS= read -r target; do
+    route="$(route_prefix "$target")"
+    destination="$(probe_address "$target")"
+    changed=0
+
+    if ! ip -4 route get "$destination" 2>/dev/null | grep -q "dev ${LAN_IF} .*src ${LAN_IP}"; then
+      changed=1
+    fi
+
+    if (( changed )); then
+      ip route replace "$route" dev "$LAN_IF" src "$LAN_IP"
+      record_owned_route "$route"
+      log "preferred $route via $LAN_IF src $LAN_IP"
+    fi
+  done < <(managed_targets)
+}
+
+remove_lan_overrides() {
+  local target route line file owned_route owned_if owned_ip
+
+  while IFS= read -r target; do
+    route="$(route_prefix "$target")"
+    file="$(state_file "$route")"
+    [[ -r "$file" ]] || continue
+    IFS=$'\t' read -r owned_route owned_if owned_ip < "$file" || continue
+    [[ "$owned_route" == "$route" && -n "$owned_if" && -n "$owned_ip" ]] || continue
+
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      case "$line" in
+        *" dev ${owned_if} "*" src ${owned_ip}"*)
+          ip route del "$route" dev "$owned_if" src "$owned_ip" 2>/dev/null || true
+          clear_owned_route "$route"
+          log "removed stale owned trusted-LAN override for $route"
+          ;;
+      esac
+    done < <(ip route show "$route" 2>/dev/null || true)
+  done < <(managed_targets)
+}
+
+install_pangolin_routes() {
+  local target route destination changed
+
+  if ! ip link show "$PANGOLIN_IF" >/dev/null 2>&1; then
+    log "trusted LAN not detected and $PANGOLIN_IF is absent; managed routes remain unchanged"
+    return 0
+  fi
+
+  while IFS= read -r target; do
+    route="$(route_prefix "$target")"
+    destination="$(probe_address "$target")"
+    changed=0
+
+    if ! ip -4 route get "$destination" 2>/dev/null | grep -q " dev ${PANGOLIN_IF} "; then
+      changed=1
+    fi
+
+    if (( changed )); then
+      ip route replace "$route" dev "$PANGOLIN_IF"
+      log "preferred $route via $PANGOLIN_IF"
+    fi
+  done < <(managed_targets)
+}
+
+reconcile_once() {
+  if [[ -z "${PANGOLIN_MANAGED_HOSTS:-}" ]]; then
+    return 0
+  fi
+
+  if detect_lan; then
+    install_lan_routes
+  else
+    log "trusted LAN not detected; preferring Pangolin routes for managed hosts"
+    remove_lan_overrides
+    install_pangolin_routes
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --settle)
+      SETTLE_SECONDS="${2:-}"
+      [[ "$SETTLE_SECONDS" =~ ^[0-9]+$ ]] || { usage; exit 2; }
+      shift 2
+      ;;
+    --status)
+      status
+      exit 0
+      ;;
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+if (( SETTLE_SECONDS > 0 )); then
+  deadline=$((SECONDS + SETTLE_SECONDS))
+  while (( SECONDS <= deadline )); do
+    reconcile_once
+    sleep 2
+  done
+else
+  reconcile_once
+fi

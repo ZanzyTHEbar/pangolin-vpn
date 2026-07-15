@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# Readiness gate for services that depend on private resources reachable over
+# either a trusted LAN path or the Pangolin VPN.
+
+set -euo pipefail
+
+ENV_FILE="${PANGOLIN_ENV_FILE:-/etc/pangolin-client/pangolin-client.env}"
+
+load_env_file() {
+  local file="$1"
+  local line key value
+
+  [[ -r "$file" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    case "$line" in
+      ''|'#'*)
+        continue
+        ;;
+    esac
+
+    [[ "$line" == *=* ]] || continue
+    key="${line%%=*}"
+    value="${line#*=}"
+
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    [[ ${!key+x} ]] && continue
+
+    if (( ${#value} >= 2 )); then
+      case "$value" in
+        \"*\") value="${value:1:${#value}-2}" ;;
+        \'*\') value="${value:1:${#value}-2}" ;;
+      esac
+    fi
+
+    printf -v "$key" '%s' "$value"
+    export "$key"
+  done < "$file"
+}
+
+load_env_file "$ENV_FILE"
+
+TARGET_HOST="${PANGOLIN_READY_TARGET_HOST:-}"
+TARGET_PORT="${PANGOLIN_READY_TARGET_PORT:-}"
+PANGOLIN_SERVICE="${PANGOLIN_SERVICE:-pangolin-client.service}"
+PANGOLIN_IF="${PANGOLIN_INTERFACE_NAME:-pangolin}"
+WAIT_SECONDS="${PANGOLIN_READY_TIMEOUT:-75}"
+CONTROL_MARKER="${PANGOLIN_CONTROL_MARKER:-/run/pangolin-client-control/enabled}"
+ROUTE_HELPER="${PANGOLIN_ROUTE_HELPER:-/usr/local/sbin/pangolin-route-helper}"
+
+TRUSTED_LAN_PREFIX="${PANGOLIN_TRUSTED_LAN_PREFIX:-}"
+TRUSTED_GATEWAY="${PANGOLIN_TRUSTED_GATEWAY:-}"
+TRUSTED_GATEWAY_MAC="${PANGOLIN_TRUSTED_GATEWAY_MAC:-}"
+TRUSTED_GATEWAY_PROBE_TIMEOUT="${PANGOLIN_TRUSTED_GATEWAY_PROBE_TIMEOUT:-2}"
+
+log() {
+  local message="$*"
+
+  echo "pangolin-vpn-ready: $message"
+  if command -v logger >/dev/null 2>&1; then
+    logger -t pangolin-vpn-ready -- "$message" || true
+  fi
+}
+
+fail_config() {
+  log "$*"
+  exit 2
+}
+
+probe_gateway() {
+  local ifname="$1"
+
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${TRUSTED_GATEWAY_PROBE_TIMEOUT}s" ping -c 1 -W 1 -I "$ifname" "$TRUSTED_GATEWAY" >/dev/null 2>&1 || true
+  else
+    ping -c 1 -W 1 -I "$ifname" "$TRUSTED_GATEWAY" >/dev/null 2>&1 || true
+  fi
+}
+
+trusted_lan_present() {
+  local ifname family addr ip_addr default_if default_src neigh_mac
+
+  [[ -n "$TRUSTED_LAN_PREFIX" && -n "$TRUSTED_GATEWAY" ]] || return 1
+
+  while read -r _ ifname family addr _rest; do
+    [[ "$family" == "inet" ]] || continue
+    ifname="${ifname%%@*}"
+    ip_addr="${addr%/*}"
+
+    case "$ifname" in
+      lo|"$PANGOLIN_IF"|docker*|br-*|veth*|virbr*|tailscale*|wg*)
+        continue
+        ;;
+    esac
+
+    case "$ip_addr" in
+      "$TRUSTED_LAN_PREFIX"*)
+        default_if="$(ip -4 route get "$TRUSTED_GATEWAY" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1 || true)"
+        default_src="$(ip -4 route get "$TRUSTED_GATEWAY" 2>/dev/null | sed -n 's/.* src \([^ ]*\).*/\1/p' | head -n1 || true)"
+        [[ "$default_if" == "$ifname" && "$default_src" == "$ip_addr" ]] || continue
+
+        if [[ -n "$TRUSTED_GATEWAY_MAC" ]]; then
+          probe_gateway "$ifname"
+          neigh_mac="$(ip neigh show "$TRUSTED_GATEWAY" dev "$ifname" 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "lladdr") {print tolower($(i + 1)); exit}}')"
+          [[ "$neigh_mac" == "${TRUSTED_GATEWAY_MAC,,}" ]] || continue
+        fi
+
+        return 0
+        ;;
+    esac
+  done < <(ip -o -4 addr show scope global up)
+
+  return 1
+}
+
+tcp_ready() {
+  timeout 3s bash -c 'cat < /dev/null > "/dev/tcp/$1/$2"' _ "$TARGET_HOST" "$TARGET_PORT" >/dev/null 2>&1
+}
+
+route_uses_pangolin() {
+  ip -4 route get "$TARGET_HOST" 2>/dev/null | grep -q " dev ${PANGOLIN_IF} "
+}
+
+run_route_helper() {
+  if [[ -x "$ROUTE_HELPER" ]]; then
+    "$ROUTE_HELPER" >/dev/null 2>&1 || true
+  fi
+}
+
+[[ -n "$TARGET_HOST" ]] || fail_config "PANGOLIN_READY_TARGET_HOST is not set"
+[[ -n "$TARGET_PORT" ]] || fail_config "PANGOLIN_READY_TARGET_PORT is not set"
+[[ "$WAIT_SECONDS" =~ ^[0-9]+$ ]] || fail_config "PANGOLIN_READY_TIMEOUT must be an integer"
+
+if trusted_lan_present; then
+  run_route_helper
+  if tcp_ready; then
+    log "trusted LAN path to ${TARGET_HOST}:${TARGET_PORT} is ready"
+    exit 0
+  fi
+  log "trusted LAN detected but ${TARGET_HOST}:${TARGET_PORT} is not reachable"
+  exit 1
+fi
+
+if [[ ! -e "$CONTROL_MARKER" ]]; then
+  log "Pangolin manual control is off; run 'pangolin-vpn on' before using VPN-dependent resources"
+  exit 1
+fi
+
+systemctl start "$PANGOLIN_SERVICE" >/dev/null 2>&1 || true
+
+deadline=$((SECONDS + WAIT_SECONDS))
+while (( SECONDS <= deadline )); do
+  run_route_helper
+
+  if ip link show "$PANGOLIN_IF" >/dev/null 2>&1 && route_uses_pangolin && tcp_ready; then
+    log "Pangolin path to ${TARGET_HOST}:${TARGET_PORT} is ready"
+    exit 0
+  fi
+
+  sleep 2
+done
+
+log "timed out waiting ${WAIT_SECONDS}s for trusted LAN or Pangolin path to ${TARGET_HOST}:${TARGET_PORT}"
+exit 1
